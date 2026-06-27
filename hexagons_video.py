@@ -173,40 +173,42 @@ def draw_hexes(img: np.ndarray, t: float) -> None:
 
     Draw order: all ghosts first (behind), then all base tiles on top.
     """
-    DISP = SR * 0.18   # max vertical displacement (fraction of tile radius)
-    AMP  = 0.05        # subtle brightness lift at peak
+    DISP       = SR * 0.18   # max vertical displacement (fraction of tile radius)
+    AMP        = 0.05        # subtle brightness lift at peak
+    SCALE_AMP  = 0.08        # ±8 % size change between wave peak and trough
 
     # Precompute per-hex screen position and colours for both passes.
     # dy is kept as a float; hex_pts_sp handles sub-pixel precision.
     tiles = []
     for i, h in enumerate(hexes):
-        wave_val   = math.sin(2 * math.pi * (t - _hex_spatial[i]))
-        dy         = -DISP * wave_val
-        brightness = 1.0 + AMP * wave_val
-        a          = h.get('alpha', 0.12)
-        r, g, b    = (demix(c, a) for c in h['color'])
+        wave_val    = math.sin(2 * math.pi * (t - _hex_spatial[i]))
+        dy          = -DISP * wave_val
+        brightness  = 1.0 + AMP * wave_val
+        size_scale  = 1.0 + SCALE_AMP * wave_val   # bigger at peak, smaller at trough
+        a           = h.get('alpha', 0.12)
+        r, g, b     = (demix(c, a) for c in h['color'])
         r2 = min(255, max(0, round(r * brightness)))
         g2 = min(255, max(0, round(g * brightness)))
         b2 = min(255, max(0, round(b * brightness)))
         sx, sy = scr(h['x'], h['y'])
-        tiles.append((sx, sy + dy, r2, g2, b2, a))
+        tiles.append((sx, sy + dy, r2, g2, b2, a, size_scale))
 
     # Pass 1: ghost copies — real alpha blend so overlapping hexes show through.
     # Each shift gets an independent lighten factor: 0 = base colour, 1 = white.
-    for (sx, sy, r2, g2, b2, a) in tiles:
+    for (sx, sy, r2, g2, b2, a, size_scale) in tiles:
         for (lx, ly), lighten in ((_S2, LIGHTEN_UL), (_S1, LIGHTEN_UR)):
             lr = min(255, round(r2 + (255 - r2) * lighten))
             lg = min(255, round(g2 + (255 - g2) * lighten))
             lb = min(255, round(b2 + (255 - b2) * lighten))
             overlay = img.copy()
-            pts = hex_pts_sp(sx + lx, sy + ly, SR * 0.96)
+            pts = hex_pts_sp(sx + lx, sy + ly, SR * 0.96 * size_scale)
             cv2.fillConvexPoly(overlay, pts, (lb, lg, lr), cv2.LINE_AA, _SUBPIX)
             cv2.addWeighted(overlay, a, img, 1.0 - a, 0, img)
 
     # Pass 2: base tiles — also alpha-blended, same approach as ghost copies.
-    for (sx, sy, r2, g2, b2, a) in tiles:
+    for (sx, sy, r2, g2, b2, a, size_scale) in tiles:
         overlay = img.copy()
-        pts = hex_pts_sp(sx, sy, SR * 0.96)
+        pts = hex_pts_sp(sx, sy, SR * 0.96 * size_scale)
         cv2.fillConvexPoly(overlay, pts, (b2, g2, r2), cv2.LINE_AA, _SUBPIX)
         cv2.addWeighted(overlay, a, img, 1.0 - a, 0, img)
 
