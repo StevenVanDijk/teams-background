@@ -1,0 +1,11 @@
+# generated outputs
+*.mp4
+hexagons.svg
+
+# source images (large binaries / proprietary stock photos)
+*.jpg
+*.jpeg
+*.png
+
+# Claude Code internal
+.claude/

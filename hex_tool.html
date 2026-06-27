@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Hexagon Extraction Tool</title>
+<link rel="stylesheet" href="hex_tool.css"/>
+</head>
+<body>
+<div id="top">
+  <input id="fi" type="file" accept="image/*"/>
+  <span class="sep"></span>
+  <button id="bCal">Calibrate</button>
+  <button id="bScan" disabled>Scan</button>
+  <button id="bEdit" disabled>Edit</button>
+  <button id="bFill" disabled>Fill: OFF</button>
+  <span class="sep"></span>
+  <button id="bNcal" disabled>Net cal</button>
+  <button id="bEye" disabled>Eyedropper</button>
+  <button id="bDetect" disabled>Detect</button>
+  <button id="bDbg" disabled>Debug</button>
+  <button id="bNet" disabled class="on">Network: ON</button>
+  <span class="sep"></span>
+  <button id="bNode" disabled>Nodes</button>
+  <button id="bEdge" disabled>Edges</button>
+  <span class="sep"></span>
+  <button id="bSample" disabled>Sample</button>
+  <button id="bCompare" disabled>Compare</button>
+  <button id="bSolve" disabled>Solve</button>
+  <button id="bExp" disabled>Export</button>
+  <span class="sep"></span>
+  <span id="swatch"></span>
+  <span id="swatch2" style="display:none"></span>
+  <span class="sep"></span>
+  <label>zoom <input id="zoom" type="range" min="10" max="150" value="40"></label>
+  <label>tol <input id="tol" type="range" min="1" max="80" value="20"><span id="tolVal">20</span></label>
+  <label>threshold <input id="thr" type="range" min="4" max="60" value="14"><span id="thrVal">14</span></label>
+  <label>spacing <input id="spc" type="range" min="100" max="300" value="100"><span id="spcVal">100</span>%</label>
+  <label>smp X <input id="sox" type="range" min="-200" max="200" value="0"><span id="soxVal">0</span></label>
+  <label>smp Y <input id="soy" type="range" min="-200" max="200" value="0"><span id="soyVal">0</span></label>
+</div>
+<div id="status">Load the raster image to begin.</div>
+<div id="view"><div id="stack"><canvas id="img"></canvas><canvas id="ovl"></canvas></div></div>
+<div id="exportPanel">
+  <div><b>Extracted data</b></div>
+  <textarea id="json" readonly></textarea>
+  <div class="row">
+    <button id="bCopy">Select all</button>
+    <button id="bSave">Save as JSON</button>
+    <button id="bClose">Close</button>
+  </div>
+</div>
+<script src="hexagons_data.js"></script>
+<script src="hex_tool.js"></script>
+</body>
+</html>
