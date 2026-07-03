@@ -15,20 +15,47 @@ To add an effect, define a function and insert a call in draw_frame.
 import json
 import math
 import random as _rnd
+import argparse
 import sys
 import os
 import shutil
 import subprocess
+from collections import deque
 import numpy as np
 import cv2
 
 # ── config ────────────────────────────────────────────────────────────────────
 INPUT    = 'hexagons.json'
 OUTPUT   = 'teams_background.mp4'
+PREVIEW_OUTPUT = 'teams_background_preview.png'
 W, H     = 1280, 720
 FPS      = 30
 DURATION = 12         # seconds
-BG       = (245, 243, 241)   # BGR warm-white background
+# PowerPoint background gradient (Linear, 280°) from provided exact stop colors.
+# Stops:
+# - 58% White, Accent 1, Lighter 95%
+# - 79% Light Turquoise, Accent 1, Lighter 55%
+# - 89% Light Turquoise, Accent 1, Lighter 55%
+# - 100% Light Turquoise, Accent 1, Lighter 70%
+BG_GRADIENT_ANGLE_DEG = 280.0
+BG_STOPS_RGB = [
+    (58.0,  (240, 248, 253)),  # #F0F8FD
+    (79.0,  (116, 196, 233)),  # #74C4E9
+    (89.0,  (116, 196, 233)),  # #74C4E9
+    (100.0, (162, 216, 240)),  # #A2D8F0
+]
+BG_TRAIL  = (240, 248, 253)   # pulse trail starts from light background tone
+
+# Optional logo overlays (PNG with transparency recommended).
+LEFT_LOGO_PATH = 'Plus Symbol Combined v2.png'
+RIGHT_LOGO_PATH = 'Logiqcare_logo_transparent_magenta_lightblue.png'
+
+LEFT_LOGO_MAX_W = 300
+RIGHT_LOGO_MAX_W = 400
+LOGO_MARGIN_X = 36
+LOGO_MARGIN_Y = 28
+LEFT_LOGO_OFFSET_Y = 0   # extra vertical offset for left logo (pixels, +down / -up)
+RIGHT_LOGO_OFFSET_Y = 80  # extra vertical offset for right logo (pixels, +down / -up)
 FILL_PAD   = 1.08     # horizontal fill fraction (>1.0 zooms in, removing side bands)
 BOTTOM_PAD = 30       # pixels of breathing room below the lowest hex
 
@@ -38,7 +65,7 @@ LIGHTEN_UL = 0.20    # upper-left ghost layer
 LIGHTEN_UR = 0.45    # upper-right ghost layer
 
 # Energy pulse travelling along the network path.
-PULSE_PERIOD = 12.0   # seconds per traversal (one pass per loop)
+PULSE_PERIOD = float(DURATION)   # seconds per traversal (one pass per loop)
 # ─────────────────────────────────────────────────────────────────────────────
 
 with open(INPUT) as f:
@@ -102,6 +129,135 @@ def hex_pts_sp(cx, cy, r):
         for k in range(6)
     ], dtype=np.int32)
 
+def make_linear_gradient_with_stops(h: int, w: int,
+                                    angle_deg: float,
+                                    stops_rgb: list[tuple[float, tuple[int, int, int]]]) -> np.ndarray:
+    """Build an angled linear RGB gradient with PowerPoint-style stop positions."""
+    # Convert stops to sorted arrays in [0, 1].
+    stops_sorted = sorted((p / 100.0, rgb) for p, rgb in stops_rgb)
+    pos = np.array([p for p, _ in stops_sorted], dtype=np.float32)
+    cols = np.array([rgb for _, rgb in stops_sorted], dtype=np.float32)  # RGB
+
+    # Clamp out-of-range sides like Office gradients effectively do.
+    if pos[0] > 0.0:
+        pos = np.insert(pos, 0, 0.0)
+        cols = np.vstack([cols[0], cols])
+    if pos[-1] < 1.0:
+        pos = np.append(pos, 1.0)
+        cols = np.vstack([cols, cols[-1]])
+
+    # Projection axis from angle; y grows downward in image coordinates.
+    # Use +sin so 280° yields white toward the bottom and blue toward top-right.
+    theta = math.radians(angle_deg)
+    ux, uy = math.cos(theta), math.sin(theta)
+
+    xx, yy = np.meshgrid(np.linspace(0.0, 1.0, w, dtype=np.float32),
+                         np.linspace(0.0, 1.0, h, dtype=np.float32))
+    proj = (xx - 0.5) * ux + (yy - 0.5) * uy
+
+    # Normalize projection to [0,1] across the full frame corners.
+    corners = np.array([
+        (-0.5) * ux + (-0.5) * uy,
+        (0.5) * ux + (-0.5) * uy,
+        (-0.5) * ux + (0.5) * uy,
+        (0.5) * ux + (0.5) * uy,
+    ], dtype=np.float32)
+    pmin, pmax = float(corners.min()), float(corners.max())
+    t = (proj - pmin) / (pmax - pmin)
+    t = np.clip(t, 0.0, 1.0)
+
+    # Piecewise-linear interpolation per channel in RGB, then convert to BGR.
+    out = np.empty((h, w, 3), dtype=np.uint8)
+    flat_t = t.reshape(-1)
+    for c in range(3):
+        interp = np.interp(flat_t, pos, cols[:, c])
+        out[..., c] = np.clip(np.round(interp).reshape(h, w), 0, 255).astype(np.uint8)
+
+    return out[..., ::-1].copy()  # RGB -> BGR
+
+# Precompute once and clone per-frame for efficiency.
+BG_FRAME = make_linear_gradient_with_stops(H, W, BG_GRADIENT_ANGLE_DEG, BG_STOPS_RGB)
+BG_FIRST_STOP_T = min(p for p, _ in BG_STOPS_RGB) / 100.0
+
+def make_gradient_t_map(h: int, w: int, angle_deg: float) -> np.ndarray:
+    """Normalized gradient coordinate map (0..1), shared for stop-based masking."""
+    theta = math.radians(angle_deg)
+    ux, uy = math.cos(theta), math.sin(theta)
+
+    xx, yy = np.meshgrid(np.linspace(0.0, 1.0, w, dtype=np.float32),
+                         np.linspace(0.0, 1.0, h, dtype=np.float32))
+    proj = (xx - 0.5) * ux + (yy - 0.5) * uy
+
+    corners = np.array([
+        (-0.5) * ux + (-0.5) * uy,
+        (0.5) * ux + (-0.5) * uy,
+        (-0.5) * ux + (0.5) * uy,
+        (0.5) * ux + (0.5) * uy,
+    ], dtype=np.float32)
+    pmin, pmax = float(corners.min()), float(corners.max())
+    t = (proj - pmin) / (pmax - pmin)
+    return np.clip(t, 0.0, 1.0)
+
+BG_T_MAP = make_gradient_t_map(H, W, BG_GRADIENT_ANGLE_DEG)
+
+def _load_logo(path: str, target_w: int):
+    """Load logo image (BGR/BGRA) and resize to target width while preserving aspect."""
+    if not os.path.exists(path):
+        return None
+    logo = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if logo is None:
+        return None
+    h0, w0 = logo.shape[:2]
+    if w0 <= 0 or h0 <= 0:
+        return None
+    if target_w > 0 and w0 != target_w:
+        scale = target_w / w0
+        nw, nh = max(1, round(w0 * scale)), max(1, round(h0 * scale))
+        interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+        logo = cv2.resize(logo, (nw, nh), interpolation=interp)
+    return logo
+
+LEFT_LOGO_IMG = _load_logo(LEFT_LOGO_PATH, LEFT_LOGO_MAX_W)
+RIGHT_LOGO_IMG = _load_logo(RIGHT_LOGO_PATH, RIGHT_LOGO_MAX_W)
+
+def draw_logo(img: np.ndarray, logo: np.ndarray | None, corner: str) -> None:
+    """Overlay logo in upper-left or upper-right, respecting alpha if present."""
+    if logo is None:
+        return
+
+    lh, lw = logo.shape[:2]
+    if corner == 'upper-right':
+        x0 = W - LOGO_MARGIN_X - lw
+        y0 = LOGO_MARGIN_Y + RIGHT_LOGO_OFFSET_Y
+    else:
+        x0 = LOGO_MARGIN_X
+        y0 = LOGO_MARGIN_Y + LEFT_LOGO_OFFSET_Y
+
+    if x0 >= W or y0 >= H:
+        return
+
+    # Clip to frame bounds.
+    x1 = min(W, x0 + lw)
+    y1 = min(H, y0 + lh)
+    if x1 <= x0 or y1 <= y0:
+        return
+
+    roi = img[y0:y1, x0:x1]
+    logo_crop = logo[:y1 - y0, :x1 - x0]
+
+    if logo_crop.shape[2] == 4:
+        alpha = (logo_crop[..., 3].astype(np.float32) / 255.0)[..., None]
+        fg = logo_crop[..., :3].astype(np.float32)
+        bg = roi.astype(np.float32)
+        out = fg * alpha + bg * (1.0 - alpha)
+        roi[:] = np.clip(np.round(out), 0, 255).astype(np.uint8)
+    else:
+        roi[:] = logo_crop[..., :3]
+
+def draw_logos(img: np.ndarray) -> None:
+    draw_logo(img, LEFT_LOGO_IMG, 'upper-left')
+    draw_logo(img, RIGHT_LOGO_IMG, 'upper-right')
+
 # ── layer-shift vectors (same geometry as hexagons_to_svg.py) ────────────────
 # Upper-right and upper-left vertices of a flat-top hex at the origin.
 _S1 = ( SR / 2, -SR * math.sqrt(3) / 2)
@@ -117,31 +273,41 @@ _proj_span = (_proj_hi - _proj_lo) or 1.0
 _hex_spatial = [(_proj[i] - _proj_lo) / _proj_span for i in range(len(hexes))]
 
 # ── pulse path precomputation ─────────────────────────────────────────────────
-# Find the longest simple path through the network using greedy DFS from every
-# starting node (fixed seed so the path is stable across renders).
-def _find_path(seed=0):
+# Find a deterministic path from the left-most node to the right-most node.
+def _find_path_left_to_right() -> list[int]:
     adj = [[] for _ in range(len(nodes))]
     for e in edges:
         adj[e[0]].append(e[1])
         adj[e[1]].append(e[0])
-    rng  = _rnd.Random(seed)
-    best = []
-    for start in range(len(nodes)):
-        visited = [False] * len(nodes)
-        path    = [start]
-        visited[start] = True
-        while True:
-            nbs = [n for n in adj[path[-1]] if not visited[n]]
-            if not nbs:
-                break
-            nxt = rng.choice(nbs)
-            path.append(nxt)
-            visited[nxt] = True
-        if len(path) > len(best):
-            best = path[:]
-    return best
 
-_pulse_path = _find_path()
+    left_idx = min(range(len(nodes)), key=lambda i: nodes[i]['x'])
+    right_idx = max(range(len(nodes)), key=lambda i: nodes[i]['x'])
+
+    parent = [-1] * len(nodes)
+    q = deque([left_idx])
+    parent[left_idx] = left_idx
+
+    # BFS for a stable, deterministic route through the connected graph.
+    while q:
+        cur = q.popleft()
+        if cur == right_idx:
+            break
+        for nxt in sorted(adj[cur]):
+            if parent[nxt] != -1:
+                continue
+            parent[nxt] = cur
+            q.append(nxt)
+
+    if parent[right_idx] == -1:
+        raise RuntimeError('No network path found from left-most node to right-most node.')
+
+    path = [right_idx]
+    while path[-1] != left_idx:
+        path.append(parent[path[-1]])
+    path.reverse()
+    return path
+
+_pulse_path = _find_path_left_to_right()
 _pulse_segs = []       # (screen_pa, screen_pb, length)
 _pulse_cuml = [0.0]   # cumulative lengths, one entry per node in path
 for _i in range(len(_pulse_path) - 1):
@@ -173,9 +339,9 @@ def draw_hexes(img: np.ndarray, t: float) -> None:
 
     Draw order: all ghosts first (behind), then all base tiles on top.
     """
-    DISP       = SR * 0.18   # max vertical displacement (fraction of tile radius)
-    AMP        = 0.05        # subtle brightness lift at peak
-    SCALE_AMP  = 0.08        # ±8 % size change between wave peak and trough
+    DISP       = SR * 0.24   # max vertical displacement (fraction of tile radius)
+    AMP        = 0.11        # brightness lift at peak
+    SCALE_AMP  = 0.11        # ±11 % size change between wave peak and trough
 
     # Precompute per-hex screen position and colours for both passes.
     # dy is kept as a float; hex_pts_sp handles sub-pixel precision.
@@ -267,7 +433,8 @@ def draw_pulse(img: np.ndarray, t: float) -> None:
         # Two-segment colour ramp: BG→orange (lower half), orange→yellow (upper half)
         if frac < 0.5:
             t2  = frac * 2.0
-            col = tuple(round(BG[j] + ([0, 120, 255][j] - BG[j]) * t2**2) for j in range(3))
+            col = tuple(round(BG_TRAIL[j] + ([0, 120, 255][j] - BG_TRAIL[j]) * t2**2)
+                        for j in range(3))
         else:
             t2  = (frac - 0.5) * 2.0
             col = tuple(round([0, 120, 255][j] + ([10, 210, 255][j] - [0, 120, 255][j]) * t2)
@@ -280,46 +447,88 @@ def draw_pulse(img: np.ndarray, t: float) -> None:
 
 # ── frame composer ────────────────────────────────────────────────────────────
 def draw_frame(t: float) -> np.ndarray:
-    img = np.full((H, W, 3), BG, dtype=np.uint8)
-    draw_hexes(img, t)     # bottom: tiles with wave
-    draw_network(img)      # middle: edges and nodes
-    draw_pulse(img, t)     # top: energy pulse along network path
+    img = BG_FRAME.copy()
+    overlay = img.copy()
+    draw_hexes(overlay, t)     # bottom: tiles with wave
+    draw_network(overlay)      # middle: edges and nodes
+    draw_pulse(overlay, t)     # top: energy pulse along network path
+
+    # Keep the animated geometry below the first stop position.
+    mask = (BG_T_MAP <= BG_FIRST_STOP_T)[..., None]
+    img = np.where(mask, overlay, img)
+
+    draw_logos(img)        # top-most: brand marks
     return img
 
-# ── encode ────────────────────────────────────────────────────────────────────
-# Pipe raw BGR frames to ffmpeg for proper H.264 encoding.
-# CRF 32 targets a low bitrate suitable for Teams animated backgrounds (~1 MB).
-# Raise CRF for smaller files (max ~51) or lower it for higher quality (min 0).
-CRF = 20
+def render_video(output_path: str = OUTPUT) -> None:
+    """Render full MP4 loop with ffmpeg."""
+    # Pipe raw BGR frames to ffmpeg for proper H.264 encoding.
+    # CRF 32 targets a low bitrate suitable for Teams animated backgrounds (~1 MB).
+    # Raise CRF for smaller files (max ~51) or lower it for higher quality (min 0).
+    crf = 20
+    total = FPS * DURATION
 
-total = FPS * DURATION
-print(f'Rendering {DURATION}s  {W}x{H}  {FPS} fps  CRF={CRF}  ->  {OUTPUT}')
+    print(f'Rendering {DURATION}s  {W}x{H}  {FPS} fps  CRF={crf}  ->  {output_path}')
 
-if not shutil.which('ffmpeg'):
-    sys.exit('Error: ffmpeg not found on PATH.')
+    if not shutil.which('ffmpeg'):
+        raise RuntimeError('ffmpeg not found on PATH.')
 
-ffmpeg_cmd = [
-    'ffmpeg', '-y',
-    '-f', 'rawvideo', '-vcodec', 'rawvideo',
-    '-s', f'{W}x{H}', '-pix_fmt', 'bgr24', '-r', str(FPS),
-    '-i', 'pipe:',
-    '-vcodec', 'libx264', '-crf', str(CRF),
-    '-pix_fmt', 'yuv420p',
-    '-movflags', 'faststart',
-    OUTPUT,
-]
-proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE,
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    ffmpeg_cmd = [
+        'ffmpeg', '-y',
+        '-f', 'rawvideo', '-vcodec', 'rawvideo',
+        '-s', f'{W}x{H}', '-pix_fmt', 'bgr24', '-r', str(FPS),
+        '-i', 'pipe:',
+        '-vcodec', 'libx264', '-crf', str(crf),
+        '-pix_fmt', 'yuv420p',
+        '-movflags', 'faststart',
+        output_path,
+    ]
+    proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-for f in range(total):
-    proc.stdin.write(draw_frame(f / total).tobytes())
-    if f % FPS == 0:
-        print(f'  {f // FPS:2d}/{DURATION}s', end='\r', flush=True)
+    for f in range(total):
+        proc.stdin.write(draw_frame(f / total).tobytes())
+        if f % FPS == 0:
+            print(f'  {f // FPS:2d}/{DURATION}s', end='\r', flush=True)
 
-proc.stdin.close()
-proc.wait()
-if proc.returncode != 0:
-    sys.exit(f'ffmpeg exited with code {proc.returncode}')
+    proc.stdin.close()
+    proc.wait()
+    if proc.returncode != 0:
+        raise RuntimeError(f'ffmpeg exited with code {proc.returncode}')
 
-size_mb = os.path.getsize(OUTPUT) / 1e6
-print(f'\nDone.  {OUTPUT}  ({size_mb:.1f} MB)')
+    size_mb = os.path.getsize(output_path) / 1e6
+    print(f'\nDone.  {output_path}  ({size_mb:.1f} MB)')
+
+
+def render_preview(preview_path: str = PREVIEW_OUTPUT) -> None:
+    """Render only first frame to PNG for fast iteration."""
+    frame0 = draw_frame(0.0)
+    ok = cv2.imwrite(preview_path, frame0)
+    if not ok:
+        raise RuntimeError(f'Failed to write preview image: {preview_path}')
+    print(f'Done.  {preview_path}')
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description='Render Teams background video or preview image.')
+    parser.add_argument('--preview-only', action='store_true', help='Render only preview PNG and exit')
+    parser.add_argument('--preview-output', default=PREVIEW_OUTPUT, help='Preview image output path')
+    parser.add_argument('--video-output', default=OUTPUT, help='Video output path')
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        if args.preview_only:
+            render_preview(args.preview_output)
+        else:
+            render_video(args.video_output)
+        return 0
+    except Exception as exc:
+        print(f'Error: {exc}', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

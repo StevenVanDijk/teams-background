@@ -7,5 +7,8 @@ hexagons.svg
 *.jpeg
 *.png
 
+# Python cache files
+**/*.pyc
+
 # Claude Code internal
 .claude/
